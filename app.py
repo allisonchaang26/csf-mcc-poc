@@ -19,6 +19,7 @@ import re
 import json
 import textwrap
 import uuid
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -159,8 +160,8 @@ _KEYWORD_RULES: list[tuple] = [
     ),
     (
         "7372",
-        ["software", "desarrollo", "programming", "it service", "tech",
-         "informatica", "digital", "saas", "desarrollo web", "app development"],
+        ["software", "desarrollo de software", "programming", "it service",
+         "informatica", "saas", "desarrollo web", "app development", "tecnologias de la informacion"],
         "A technology or software development company.",
         "Document describes software development or IT services as the primary activity.",
     ),
@@ -202,18 +203,51 @@ _KEYWORD_RULES: list[tuple] = [
 ]
 
 
+def _extract_activity_weights(normalised: str) -> dict[str, float]:
+    """
+    Parse the SAT activities table to extract percentage weights per activity.
+    Matches lines like: "panificacion tradicional   60   19/04/2023"
+    Returns mapping of activity text → weight (0.0–1.0).
+    """
+    weights: dict[str, float] = {}
+    pattern = re.compile(r"([a-z][a-z\s]{3,60}?)\s+(\d{1,3})\s+\d{2}/\d{2}/\d{4}")
+    for match in pattern.finditer(normalised):
+        activity, pct = match.group(1).strip(), int(match.group(2))
+        if 1 <= pct <= 100:
+            weights[activity] = pct / 100.0
+    return weights
+
+
 def _keyword_classify(text: str) -> dict:
     """
     Score the extracted text against keyword rules and return a classification
     result in the same shape as the Claude classifier.
+    When activity percentages are present, they weight keyword scores so the
+    primary activity (highest %) wins even with fewer raw keyword hits.
     """
-    lower = text.lower()
-    scores: list[tuple[int, str, str, str]] = []  # (hits, code, summary, rationale)
+    # Normalize: lowercase + strip accents so "panificación" matches "panificacion"
+    lower = unicodedata.normalize("NFD", text.lower())
+    lower = "".join(c for c in lower if unicodedata.category(c) != "Mn")
+
+    activity_weights = _extract_activity_weights(lower)
+
+    scores: list[tuple[float, str, str, str]] = []  # (score, code, summary, rationale)
 
     for code, keywords, summary, rationale in _KEYWORD_RULES:
-        hits = sum(1 for kw in keywords if kw in lower)
-        if hits:
-            scores.append((hits, code, summary, rationale))
+        raw_hits = sum(1 for kw in keywords if kw in lower)
+        if not raw_hits:
+            continue
+        if activity_weights:
+            # Percentage-aware: declared activity weight is the primary signal,
+            # raw keyword hits are a small tiebreaker (0.01 per hit).
+            pct_score = max(
+                (w for act, w in activity_weights.items() if any(kw in act for kw in keywords)),
+                default=0.0,
+            )
+            score = pct_score + raw_hits * 0.01
+        else:
+            score = float(raw_hits)
+        scores.append((score, code, summary, rationale))
 
     scores.sort(key=lambda x: -x[0])
 
@@ -235,8 +269,11 @@ def _keyword_classify(text: str) -> dict:
         }
 
     candidates = []
-    for rank, (hits, code, summary, rationale) in enumerate(scores[:3]):
-        confidence = "high" if rank == 0 and hits >= 2 else ("medium" if hits >= 1 else "low")
+    for rank, (score, code, summary, rationale) in enumerate(scores[:3]):
+        if activity_weights:
+            confidence = "high" if score >= 0.5 else ("medium" if score >= 0.2 else "low")
+        else:
+            confidence = "high" if (rank == 0 and score >= 2) else ("medium" if score >= 1 else "low")
         candidates.append({
             "mcc_code": code,
             "mcc_description": MCC_TABLE.get(code, ""),
